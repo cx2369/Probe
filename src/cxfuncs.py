@@ -18,14 +18,20 @@ import time
 import torch
     
 class CXFUZZ:
+    test1 = 0.0
     count_class_lookup8 = np.zeros(256,dtype=np.uint8)
     stop_requested = False
     output_dir = ""
     debug_api = ""
+    initial_corpus = ""
     map_size = 0
+    map_size2 = 0
     full_map_size = 0
     shm = None
+    shm2 = None
     trace_bits = None
+    trace_bits2 = None
+    virgin_dict = None
     virgin_bits = None
     crash_bits = None
     dtypes = None
@@ -55,6 +61,7 @@ class CXFUZZ:
     cur_input_file = ""
     queue_minibits_dict = {}
     favored_queue_list = []
+    passed_queues_list = []
     queue_fuzzed = {}
     cur_seed_name = ""
     cur_input_args_for_mutate = []
@@ -71,6 +78,7 @@ class CXFUZZ:
     cur_input_kwargs_for_mutate3 = {}
     cur_output_kwargs_of_mutate3 = {}
     total_runs = 0
+    passed_runs = 0
     timeout_nums = 0
     memout_nums = 0
     hnc_nums = 0
@@ -88,10 +96,16 @@ class CXFUZZ:
     seed_size_limit = 0
     cur_api_is_class = False
     run_asan_nums = 0
-    enable_asan_check = None
-    enable_diff_check = None
+    enable_asan_func_hash_check = None
+    enable_asan_trace_bits_hash_check = None
+    enable_diff_func_hash_check = None
+    enable_diff_trace_bits_hash_check = None
     log_file = None
+    cur_fuzzed_file = None
     shm_clean_threshold = None
+    plot_data_file = None
+    current_time_s = 0
+    last_check_llm_iterations = 0
 
     def __init__(self):
         pass
@@ -131,6 +145,7 @@ class CXFUZZ:
         self.init_count_class_lookup8()
         self.fuzzing_api_nums = CXCONFIG.fuzzing_api_nums
         self.map_size = CXCONFIG.map_size
+        self.map_size2 = CXCONFIG.map_size2
         self.full_map_size = CXCONFIG.full_map_size
         self.limit_timeout = CXCONFIG.limit_timeout
         self.limit_memory_m = CXCONFIG.limit_memory_m
@@ -139,6 +154,7 @@ class CXFUZZ:
         self.seed_size_limit = CXCONFIG.seed_size_limit
         self.init_trace_bits()
         self.init_virgin_bits()
+        self.virgin_dict = {"updated_time_ms":0.0,"updated_count":0}
         self.init_crash_bits()
         self.dtypes = [
         torch.bool,
@@ -162,8 +178,10 @@ class CXFUZZ:
         self.interesting_uint_values = CXCONFIG.interesting_uint_values
         self.interesting_strings = CXCONFIG.interesting_strings
         self.start_time_s = int(time.time())
-        self.enable_asan_check = CXCONFIG.enable_asan_check
-        self.enable_diff_check = CXCONFIG.enable_diff_check
+        self.enable_asan_func_hash_check = CXCONFIG.enable_asan_func_hash_check
+        self.enable_asan_trace_bits_hash_check = CXCONFIG.enable_asan_trace_bits_hash_check
+        self.enable_diff_func_hash_check = CXCONFIG.enable_diff_func_hash_check
+        self.enable_diff_trace_bits_hash_check = CXCONFIG.enable_diff_trace_bits_hash_check
         self.shm_clean_threshold = CXCONFIG.shm_clean_threshold
 
     def init_count_class_lookup8(self):
@@ -197,10 +215,14 @@ class CXFUZZ:
 
     def init_trace_bits(self):
         try:
-            shm_name = f"cov_{os.getpid()}_{int(time.time())}"
+            shm_name = f"cov_{os.getpid()}_{random.getrandbits(32)}"
             self.shm = shared_memory.SharedMemory(name=shm_name,create=True,size=self.full_map_size)
             self.trace_bits = np.ndarray((self.full_map_size,),dtype=np.uint8,buffer=self.shm.buf)
             self.trace_bits.fill(0)
+            shm_name2 = f"cov_{os.getpid()}_{random.getrandbits(32)}"
+            self.shm2 = shared_memory.SharedMemory(name=shm_name2,create=True,size=self.map_size2)
+            self.trace_bits2 = np.ndarray((self.map_size2,),dtype=np.uint8,buffer=self.shm2.buf)
+            self.trace_bits2.fill(0)
         except:
             self.fatal_error()
 
@@ -209,6 +231,12 @@ class CXFUZZ:
             try:
                 self.shm.close()
                 self.shm.unlink()
+            except:
+                self.fatal_error()
+        if self.shm2 is not None:
+            try:
+                self.shm2.close()
+                self.shm2.unlink()
             except:
                 self.fatal_error()
 
@@ -227,7 +255,7 @@ class CXFUZZ:
     def create_api_folders(self):
         if not self.fuzzing_api_list:
             self.fatal_error()
-        required_subdirs = ['queue', 'crashes']
+        required_subdirs = ['queue', 'crashes', 'llm-in', 'llm-dealed']
         for api_name in self.fuzzing_api_list:
             folder_name = api_name
             api_dir = os.path.join(self.output_dir,folder_name)
@@ -262,9 +290,19 @@ class CXFUZZ:
         except:
             self.fatal_error()
         self.log_file = log_file
+        cur_fuzzed_file = os.path.join(self.output_dir,'cur_fuzzed.txt')
+        if os.path.exists(cur_fuzzed_file):
+            self.fatal_error()
+        self.cur_fuzzed_file = cur_fuzzed_file
         for api_name in self.fuzzing_api_list:
             folder_name = api_name
             api_dir = os.path.join(self.output_dir,folder_name)
+            plot_data_file = os.path.join(api_dir,'plot_data.txt')
+            if os.path.exists(plot_data_file):
+                self.fatal_error()
+            else:
+                with open(plot_data_file, 'w') as f:
+                    pass
             queue_hashes_file = os.path.join(api_dir,'queue_hashes.pkl')
             if os.path.exists(queue_hashes_file):
                 self.fatal_error()
@@ -282,11 +320,27 @@ class CXFUZZ:
                     pickle.dump({},f)
             except:
                 self.fatal_error()
+            queue_passed_file = os.path.join(api_dir,'queue_passed.pkl')
+            if os.path.exists(queue_passed_file):
+                self.fatal_error()
+            try:
+                with open(queue_passed_file,'wb') as f:
+                    pickle.dump([],f)
+            except:
+                self.fatal_error()
             virgin_bits_file = os.path.join(api_dir,'virgin_bits.npy')
             if os.path.exists(virgin_bits_file):
                 self.fatal_error()
             try:
                 np.save(virgin_bits_file,self.virgin_bits)
+            except:
+                self.fatal_error()
+            virgin_dict_file = os.path.join(api_dir,'virgin_dict.pkl')
+            if os.path.exists(virgin_dict_file):
+                self.fatal_error()
+            try:
+                with open(virgin_dict_file,'wb') as f:
+                    pickle.dump({"updated_time_ms":0.0,"updated_count":0},f)
             except:
                 self.fatal_error()
             crash_bits_file = os.path.join(api_dir,'crash_bits.npy')
@@ -339,6 +393,49 @@ class CXFUZZ:
             minibits_path = os.path.join(queue_dir,minibits_file)
             np.save(minibits_path, minibits)
 
+    def load_initial_corpus(self):
+        loaded_for_api_nums = 0
+        for cur_api in self.fuzzing_api_list:
+            self.set_cur_api_to_fuzz(cur_api)
+            target = os.path.join(self.initial_corpus, cur_api)
+            if os.path.isdir(target):
+                loaded_for_api_nums +=1
+                files = [os.path.join(target, f) for f in os.listdir(target) if os.path.isfile(os.path.join(target, f))]
+                if not files:
+                    self.fatal_error(f"no input file in {target}")
+                else:
+                    for f in files:
+                        cur_input = torch.load(f)
+                        self.cur_output_args_of_mutate = cur_input[0]
+                        self.cur_output_kwargs_of_mutate = cur_input[1]
+                        self.cur_output_args_of_mutate2 = cur_input[2]
+                        self.cur_output_kwargs_of_mutate2 = cur_input[3]
+                        print(f"loading:{f}")
+                        status = self.runapi()
+                        self.classify_counts()
+                        if status < 0:
+                            # crash
+                            self.fatal_error(f"crash with {f}")
+                        else:
+                            if status in (2,3):
+                                self.fatal_error(f"time/mem out with {f}")
+                            elif status ==1:
+                                self.fatal_error(f"exception with {f}")
+                            elif status == 0:
+                                self.passed_runs += 1
+                                hnb = self.has_new_bits()
+                                if hnb > 0:
+                                    self.save_to_queue(status)
+                                    self.update_virgin_bits()
+                                    self.update_queue_minibits_dict()
+                                    self.update_favored_queue()
+                                    self.cur_map_density = self.virgin_byte_density()
+                                    self.update_plot_data_file()
+                            else:
+                                self.fatal_error(f"status:{status}")
+        print(f"loaded_for_api_nums:{loaded_for_api_nums}")
+        time.sleep(3)
+
     def load_queue_minibits_dict(self):
         self.queue_minibits_dict = {}
         queue_dir = os.path.join(self.output_dir,self.cur_api_name,'queue')
@@ -383,25 +480,43 @@ class CXFUZZ:
         except:
             self.fatal_error()
 
+    def load_queue_passed(self):
+        self.passed_queues_list = []
+        api_dir = os.path.join(self.output_dir,self.cur_api_name)
+        cur_queue_passed_file = os.path.join(api_dir,'queue_passed.pkl')
+        try:
+            with open(cur_queue_passed_file, 'rb') as f:
+                self.passed_queues_list = pickle.load(f)
+        except:
+            self.fatal_error()
+
     def set_cur_api_to_fuzz(self, api_name):
         if api_name not in self.fuzzing_api_list:
             self.fatal_error()
         self.cur_api_name = api_name
         api_dir = os.path.join(self.output_dir,api_name)
+        with open(self.cur_fuzzed_file, "w", encoding="utf-8") as f:
+            f.write(self.cur_api_name)
+            f.write("\n")
+        self.plot_data_file = os.path.join(api_dir,'plot_data.txt')
         cur_virgin_bits_file = os.path.join(api_dir,'virgin_bits.npy')
+        cur_virgin_dict_file = os.path.join(api_dir,'virgin_dict.pkl')
         cur_crash_bits_file = os.path.join(api_dir,'crash_bits.npy')
         queue_hashes_file = os.path.join(api_dir,'queue_hashes.pkl')
-        for file in [cur_virgin_bits_file,cur_crash_bits_file,queue_hashes_file]:
+        for file in [cur_virgin_bits_file,cur_virgin_dict_file,cur_crash_bits_file,queue_hashes_file]:
             if not os.path.exists(file):
                 self.fatal_error()
         try:
             self.virgin_bits = np.load(cur_virgin_bits_file)
+            with open(cur_virgin_dict_file, 'rb') as f:
+                self.virgin_dict = pickle.load(f)
             self.crash_bits = np.load(cur_crash_bits_file)
             with open(queue_hashes_file, 'rb') as f:
                 self.queue_hashes = pickle.load(f)
             self.load_queue_minibits_dict()
             self.update_favored_queue()
             self.load_queue_fuzzed()
+            self.load_queue_passed()
         except:
             self.fatal_error()
         # cur api is class?
@@ -416,6 +531,7 @@ class CXFUZZ:
     def choose_one_seed(self):
         if len(self.api_queue_list[self.cur_api_name]) < 1:
             self.fatal_error()
+        passed = [seed for seed in self.passed_queues_list]
         unfuzzed_favored = [seed for seed in self.favored_queue_list 
                             if seed not in self.queue_fuzzed or self.queue_fuzzed[seed] == 0]
         all_unfuzzed = [seed for seed in self.api_queue_list[self.cur_api_name]
@@ -434,6 +550,10 @@ class CXFUZZ:
                 choosed_seed = random.choice(self.favored_queue_list)
             else:
                 choosed_seed = random.choice(self.api_queue_list[self.cur_api_name])
+        if passed:
+            pro = random.random()
+            if pro < 0.50:
+                choosed_seed = random.choice(self.passed_queues_list)
         self.cur_seed_name = choosed_seed
         queue_dir = os.path.join(self.output_dir,self.cur_api_name,'queue')
         cur_seed_path = os.path.join(queue_dir,self.cur_seed_name)
@@ -476,30 +596,41 @@ class CXFUZZ:
         with open(cur_queue_fuzzed_file, 'wb') as f:
             pickle.dump(self.queue_fuzzed, f)
 
+    def store_queue_passed(self):
+        api_dir = os.path.join(self.output_dir,self.cur_api_name)
+        cur_queue_passed_file = os.path.join(api_dir,'queue_passed.pkl')
+        with open(cur_queue_passed_file, 'wb') as f:
+            pickle.dump(self.passed_queues_list, f)
+
     def save_cur_api_fuzz_info(self):
         if not self.cur_api_name:
             self.fatal_error()
         api_dir = os.path.join(self.output_dir,self.cur_api_name)
         cur_virgin_bits_file = os.path.join(api_dir, 'virgin_bits.npy')
+        cur_virgin_dict_file = os.path.join(api_dir,'virgin_dict.pkl')
         cur_crash_bits_file = os.path.join(api_dir, 'crash_bits.npy')
         cur_queue_hashes_file = os.path.join(api_dir,'queue_hashes.pkl')
-        for file in [cur_virgin_bits_file,cur_crash_bits_file,cur_queue_hashes_file]:
+        for file in [cur_virgin_bits_file,cur_virgin_dict_file,cur_crash_bits_file,cur_queue_hashes_file]:
             if not os.path.exists(file):
                 self.fatal_error()
             os.remove(file)
         try:
             np.save(cur_virgin_bits_file, self.virgin_bits)
+            with open(cur_virgin_dict_file,'wb') as f:
+                pickle.dump(self.virgin_dict,f)
             np.save(cur_crash_bits_file, self.crash_bits)
             with open(cur_queue_hashes_file,'wb') as f:
                 pickle.dump(self.queue_hashes,f)
         except:
             self.fatal_error()
         self.store_queue_fuzzed()
+        self.store_queue_passed()
         self.virgin_bits = None
+        self.virgin_dict = None
         self.crash_bits = None
         self.cur_api_name = ""
 
-    def numby_count_covered_bytes(self,virgin_bits, map_size):
+    def numby_count_covered_bytes(self,virgin_bits,map_size):
         if len(virgin_bits) != map_size:
             self.fatal_error()
         return np.sum(virgin_bits != 0xFF)
@@ -531,16 +662,22 @@ class CXFUZZ:
             f"iterations: {self.iterations} | "
             f"stage cur: {self.stage_cur} | "
             f"stage max: {self.stage_max} | "
-            f"hash nums: {len(self.queue_hashes)} | "
             f"map density: {self.cur_map_density*100:.2f}% | \n"
             f"time: {elapsed_time}s | "
             f"runok: {self.total_runs} | "
+            f"passedok: {self.passed_runs} | "
             f"runasan: {self.run_asan_nums} | "
             f"timeout: {self.timeout_nums} | "
-            f"memout: {self.memout_nums} | "
+            f"memout: {self.memout_nums} | \n"
             f"queue nums: {self.api_queue_nums[self.cur_api_name]} | "
-            f"favored queuen nums: {len(self.favored_queue_list)} | \n"
+            f"favored queuen nums: {len(self.favored_queue_list)} | "
+            f"passed queuen nums: {len(self.passed_queues_list)} | \n"
             f"crashes: {self.hnc_nums}|{self.asan_crashes}({self.total_crashes})    \n"
+            f"trace hash nums: {len(self.queue_hashes)} | "
+            f"trace hash updated time ms: {self.test1} | \n"
+            f"func hash updated count: {self.virgin_dict['updated_count']} | "
+            f"func hash key len: {len(self.virgin_dict)} | "
+            f"func hash updated time ms: {self.virgin_dict['updated_time_ms']} | \n"
             )
             sys.stdout.flush()
 
@@ -990,15 +1127,17 @@ class CXFUZZ:
                 cur_tensor = self.generate_bool_tensor(shape)
             elif pro < 0.2:
                 cur_tensor = self.generate_complex_tensor(shape)
+            # pytorch says "Should we just yank all quantization logic as all relevant parts should have been migrated to AO?"
+            # https://github.com/pytorch/pytorch/issues/162801
+            # elif pro < 0.3:
+            #     cur_tensor = self.generate_quantize_tensor(shape)
             elif pro < 0.3:
-                cur_tensor = self.generate_quantize_tensor(shape)
-            elif pro < 0.4:
                 cur_tensor = self.generate_sparse_tensor(shape)
-            elif pro < 0.6:
+            elif pro < 0.5:
                 dtypes = [torch.int8, torch.int16, torch.int32, torch.int64]
                 dtype = random.choice(dtypes)
                 cur_tensor = self.generate_int_tensor(shape, dtype)
-            elif pro < 0.8:
+            elif pro < 0.7:
                 dtypes = [torch.uint8, torch.uint16,
                           torch.uint32, torch.uint64]
                 dtype = random.choice(dtypes)
@@ -1280,7 +1419,12 @@ class CXFUZZ:
         self.fatal_error()
 
     def normal_mutate_args(self):
-        num_mutations = self.gen_random_with_weithts(1,10)
+        count = self.count_items(self.cur_output_args_of_mutate)
+        pro = random.random()
+        if pro < 0.9 or count < 1:
+            num_mutations = self.gen_random_with_weithts(1,10)
+        else:
+            num_mutations = random.randint(1, count)
         for _ in range(num_mutations):
             if not self.cur_output_args_of_mutate:
                 new_item = self._generate_random_args_item()
@@ -1312,7 +1456,12 @@ class CXFUZZ:
                 self.fatal_error()
 
     def normal_mutate_kwargs(self):
-        num_mutations = self.gen_random_with_weithts(1,10)
+        count = len(self.cur_output_kwargs_of_mutate)
+        pro = random.random()
+        if pro < 0.9 or count < 1:
+            num_mutations = self.gen_random_with_weithts(1,10)
+        else:
+            num_mutations = random.randint(1, count)
         for _ in range(num_mutations):
             if not self.cur_output_kwargs_of_mutate:
                 new_pair = self._generate_random_kwargs_item()
@@ -1933,7 +2082,14 @@ class CXFUZZ:
         count = self.count_items(self.cur_output_args_of_mutate)
         if count == 0:
             return False
-        num_mutations = random.randint(1, count)
+        if count > 3:
+            pro = random.random()
+            if pro < 0.5:
+                num_mutations = self.gen_random_with_weithts(1, count)
+            else:
+                num_mutations = random.randint(1, count)
+        else: 
+            num_mutations = random.randint(1, count)
         for _ in range(num_mutations):
             target_id = random.randint(1, count)
             target_item = self.choose_one_from_items(self.cur_output_args_of_mutate, target_id)
@@ -1943,51 +2099,72 @@ class CXFUZZ:
     def random_mutate_kwargs(self):
         if not self.cur_output_kwargs_of_mutate:
             return False
-        key = random.choice(list(self.cur_output_kwargs_of_mutate.keys()))
-        value = self.cur_output_kwargs_of_mutate[key]
-        if isinstance(value, list):
-            count = self.count_items(value)
-            if count == 0:
-                return False
-            num_mutations = random.randint(1, count)
-            for _ in range(num_mutations):
-                target_id = random.randint(1, count)
-                target_item = self.choose_one_from_items(value, target_id)
-                binary_mutate_item = self.binary_mutate_item(target_item)
-                self.cur_output_kwargs_of_mutate[key] = self.mutate_replace_item_without_containers(value, target_id, binary_mutate_item)
-        elif isinstance(value, tuple):
-            value_lst = list(value)
-            count = self.count_items(value_lst)
-            if count == 0:
-                return False
-            num_mutations = random.randint(1, count)
-            for _ in range(num_mutations):
-                target_id = random.randint(1, count)
-                target_item = self.choose_one_from_items(value_lst, target_id)
-                binary_mutate_item = self.binary_mutate_item(target_item)
-                value_lst = self.mutate_replace_item_without_containers(value_lst, target_id, binary_mutate_item)
-            value_tup = tuple(value_lst)
-            self.cur_output_kwargs_of_mutate[key] = value_tup
-        elif isinstance(value, bool):
-            self.cur_output_kwargs_of_mutate[key] = random.choice([True, False])
-        elif value is None:
-            pass
-        elif torch.is_tensor(value):
-            binary_mutate_item = self.binary_mutate_item(value)
-            self.cur_output_kwargs_of_mutate[key] = binary_mutate_item
-        elif isinstance(value, str):
-            binary_mutate_item = self.binary_mutate_item(value)
-            self.cur_output_kwargs_of_mutate[key] = binary_mutate_item
-        elif value in self.interesting_keyward_values:
-            self.cur_output_kwargs_of_mutate[key] = random.choice(self.interesting_keyward_values)
-        elif isinstance(value, int):
-            binary_mutate_item = self.binary_mutate_item(value)
-            self.cur_output_kwargs_of_mutate[key] = binary_mutate_item
-        elif isinstance(value, float):
-            binary_mutate_item = self.binary_mutate_item(value)
-            self.cur_output_kwargs_of_mutate[key] = binary_mutate_item
+        count2 = len(self.cur_output_kwargs_of_mutate)
+        pro = random.random()
+        if pro < 0.9 or count2 < 1:
+            num_mutations2 = self.gen_random_with_weithts(1,10)
         else:
-            self.fatal_error()
+            num_mutations2 = random.randint(1, count2)
+        for _2 in range(num_mutations2):
+            key = random.choice(list(self.cur_output_kwargs_of_mutate.keys()))
+            value = self.cur_output_kwargs_of_mutate[key]
+            if isinstance(value, list):
+                count = self.count_items(value)
+                if count == 0:
+                    return False
+                if count > 3:
+                    pro = random.random()
+                    if pro < 0.5:
+                        num_mutations = self.gen_random_with_weithts(1, count)
+                    else:
+                        num_mutations = random.randint(1, count)
+                else: 
+                    num_mutations = random.randint(1, count)
+                for _ in range(num_mutations):
+                    target_id = random.randint(1, count)
+                    target_item = self.choose_one_from_items(value, target_id)
+                    binary_mutate_item = self.binary_mutate_item(target_item)
+                    self.cur_output_kwargs_of_mutate[key] = self.mutate_replace_item_without_containers(value, target_id, binary_mutate_item)
+            elif isinstance(value, tuple):
+                value_lst = list(value)
+                count = self.count_items(value_lst)
+                if count == 0:
+                    return False
+                if count > 3:
+                    pro = random.random()
+                    if pro < 0.5:
+                        num_mutations = self.gen_random_with_weithts(1, count)
+                    else:
+                        num_mutations = random.randint(1, count)
+                else: 
+                    num_mutations = random.randint(1, count)
+                for _ in range(num_mutations):
+                    target_id = random.randint(1, count)
+                    target_item = self.choose_one_from_items(value_lst, target_id)
+                    binary_mutate_item = self.binary_mutate_item(target_item)
+                    value_lst = self.mutate_replace_item_without_containers(value_lst, target_id, binary_mutate_item)
+                value_tup = tuple(value_lst)
+                self.cur_output_kwargs_of_mutate[key] = value_tup
+            elif isinstance(value, bool):
+                self.cur_output_kwargs_of_mutate[key] = random.choice([True, False])
+            elif value is None:
+                pass
+            elif torch.is_tensor(value):
+                binary_mutate_item = self.binary_mutate_item(value)
+                self.cur_output_kwargs_of_mutate[key] = binary_mutate_item
+            elif isinstance(value, str):
+                binary_mutate_item = self.binary_mutate_item(value)
+                self.cur_output_kwargs_of_mutate[key] = binary_mutate_item
+            elif value in self.interesting_keyward_values:
+                self.cur_output_kwargs_of_mutate[key] = random.choice(self.interesting_keyward_values)
+            elif isinstance(value, int):
+                binary_mutate_item = self.binary_mutate_item(value)
+                self.cur_output_kwargs_of_mutate[key] = binary_mutate_item
+            elif isinstance(value, float):
+                binary_mutate_item = self.binary_mutate_item(value)
+                self.cur_output_kwargs_of_mutate[key] = binary_mutate_item
+            else:
+                self.fatal_error()
 
     def mutate(self):
         if self.stop_requested:
@@ -2001,9 +2178,9 @@ class CXFUZZ:
             os.dup2(devnull_fd, 2)
             os.close(devnull_fd)
         pro = random.random()
-        if pro < 0.5:
+        if pro < 0.3:
             self.normal_mutate_args()
-        elif pro < 0.75:
+        elif pro < 0.7:
             self.random_mutate_args()
         else:
             self.normal_mutate_args()
@@ -2013,21 +2190,21 @@ class CXFUZZ:
                 pass
             else:
                 pro = random.random()
-                if pro < 0.5:
+                if pro < 0.3:
                     self.normal_mutate_kwargs()
-                elif pro < 0.75:
+                elif pro < 0.7:
                     self.random_mutate_kwargs()
                 else:
                     self.normal_mutate_kwargs()
                     self.random_mutate_kwargs()
         else:
-            if random.random() < 0.6:
+            if random.random() < 0.5:
                 pass
             else:
                 pro = random.random()
-                if pro < 0.5:
+                if pro < 0.3:
                     self.normal_mutate_kwargs()
-                elif pro < 0.75:
+                elif pro < 0.7:
                     self.random_mutate_kwargs()
                 else:
                     self.normal_mutate_kwargs()
@@ -2047,14 +2224,15 @@ class CXFUZZ:
         '''
         return status:
         negative: crash
-        0: run ok
-        1: timeout
-        2: memout
+        0/1: run ok. 0 passed, 1 except
+        2: timeout
+        3: memout
         '''
         if self.stop_requested:
             return 0
         self.total_runs +=1
         self.trace_bits.fill(0)
+        self.trace_bits2.fill(0)
         api_parts = self.cur_api_name.split('.')
         api_func = torch
         for part in api_parts[1:]:
@@ -2065,7 +2243,7 @@ class CXFUZZ:
             if pid == 0:
                 signal.alarm(self.limit_timeout)
                 def timeout_handler(signum, frame):
-                    os._exit(1)
+                    os._exit(2)
                 signal.signal(signal.SIGALRM, timeout_handler)
                 current_vsz_mb = psutil.Process().memory_info().vms / (1024 * 1024)
                 dynamic_limit_mb = current_vsz_mb + self.limit_memory_m
@@ -2084,25 +2262,36 @@ class CXFUZZ:
                     c_shm = shared_memory.SharedMemory(name=self.shm.name)
                     trace_bits = np.ndarray((self.full_map_size,), dtype=np.uint8, buffer=c_shm.buf)
                     trace_bits_address = trace_bits.ctypes.data
+                    c_shm2 = shared_memory.SharedMemory(name=self.shm2.name)
+                    trace_bits2 = np.ndarray((self.map_size2,), dtype=np.uint8, buffer=c_shm2.buf)
+                    trace_bits2_address = trace_bits2.ctypes.data
                     os.environ["CXENV1"] = str(int(trace_bits_address))
+                    os.environ["CXENV2"] = str(int(trace_bits2_address))
                     r1 = api_func(*api_arg_list, **api_kwarg_dict)
                     if self.cur_api_is_class:
                         r2 = r1(*api_arg_list2, **api_kwarg_dict2)
                     c_shm.close()
+                    c_shm2.close()
                     signal.alarm(0)
                     os._exit(0)
                 except MemoryError:
                     os.environ["CXENV1"] = str(0)
                     c_shm.close()
-                    os._exit(2)
+                    os.environ["CXENV2"] = str(0)
+                    c_shm2.close()
+                    os._exit(3)
                 except:
                     os.environ["CXENV1"] = str(0)
                     c_shm.close()
-                    os._exit(0)
+                    os.environ["CXENV2"] = str(0)
+                    c_shm2.close()
+                    os._exit(1)
                 finally:
                     os.environ["CXENV1"] = str(0)
                     c_shm.close()
-                    os._exit(0)
+                    os.environ["CXENV2"] = str(0)
+                    c_shm2.close()
+                    os._exit(1)
             else:
                 wait_timeout = self.limit_timeout + 5
                 start_time = time.time()
@@ -2111,12 +2300,16 @@ class CXFUZZ:
                     if child_pid != 0:
                         if os.WIFEXITED(status):
                             exit_code = os.WEXITSTATUS(status)
-                            if exit_code == 2:
+                            if exit_code == 3:
+                                result = 3
+                            elif exit_code == 2:
                                 result = 2
                             elif exit_code == 1:
                                 result = 1
-                            else:
+                            elif exit_code == 0:
                                 result = 0
+                            else:
+                                self.fatal_error(f"exit_code:{exit_code}")
                         elif os.WIFSIGNALED(status):
                             signal_num = os.WTERMSIG(status)
                             result = -1
@@ -2132,7 +2325,7 @@ class CXFUZZ:
                             pass
                         except Exception as e:
                             self.fatal_error()
-                        result = 1
+                        result = 2
                         break
                     time.sleep(0.001)
             return result
@@ -2140,6 +2333,7 @@ class CXFUZZ:
             self.fatal_error()
         finally:
             os.environ["CXENV1"] = str(0)
+            os.environ["CXENV2"] = str(0)
             try:
                 os.kill(pid, signal.SIGKILL)
                 os.waitpid(pid, 0)
@@ -2147,8 +2341,7 @@ class CXFUZZ:
                 # child process has exited
                 pass
             except Exception as e:
-                print(f"{e}")
-                sys.exit(1)
+                self.fatal_error(f"{e}")
 
     def classify_counts(self):
         np.take(self.count_class_lookup8,self.trace_bits[:self.map_size], out=self.trace_bits[:self.map_size])
@@ -2233,7 +2426,7 @@ class CXFUZZ:
         ret = self.numby_has_new_bits(self.trace_bits, self.virgin_bits, self.map_size)
         return ret
     
-    def save_to_queue(self):
+    def save_to_queue(self,status):
         queue_dir = os.path.join(self.output_dir,self.cur_api_name,'queue')
         if not os.path.isdir(queue_dir):
             self.fatal_error()
@@ -2269,6 +2462,9 @@ class CXFUZZ:
         minibits_file = queue_input_file + "-minibits.npy"
         minibits_path = os.path.join(queue_dir,minibits_file)
         np.save(minibits_path, minibits)
+        if status == 0:
+            self.passed_queues_list.append(queue_input_file)
+            self.store_queue_passed()
 
     def update_queue_minibits_dict(self):
         queue_dir = os.path.join(self.output_dir,self.cur_api_name,'queue')
@@ -2355,7 +2551,8 @@ class CXFUZZ:
             if "cx unsupported:" in (output + error):
                 self.fatal_error(f"{error}")
             if exit_code not in [0,1] and \
-            "Program hit cudaErrorMemoryAllocation" not in (output + error):
+            "Program hit cudaErrorMemoryAllocation" not in (output + error) and \
+            "at __assertfail" not in (output + error):
                 crashed = True
                 return crashed
         cmd2 = [
@@ -2451,14 +2648,28 @@ class CXFUZZ:
             self.fatal_error(f"{e}")
         deleted_files = []
         for filename in files:
+            if filename in used_files:
+                continue
             filepath = os.path.join(shm_dir, filename)
-            try:
-                if os.path.isfile(filepath) and filename not in used_files:
+            if os.path.isfile(filepath):
+                try:
                     os.unlink(filepath)
                     deleted_files.append(filename)
-            except Exception as e:
-                self.fatal_error(f"{e}")
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    self.fatal_error(f"{e}")
 
+    def update_plot_data_file(self):
+        # only for running with one api
+        if not os.path.exists(self.plot_data_file):
+            self.fatal_error()
+        with open(self.plot_data_file, mode='a', encoding='utf-8') as f:
+            cur_time_s = int(time.time())-self.start_time_s
+            coverage = int(self.cur_map_density * self.map_size)
+            content = str(cur_time_s)+","+str(coverage)
+            f.write(content + '\n')
+            
     def exit_fuzz(self):
         # clean some thing before exit
         self.close_trace_bits()
