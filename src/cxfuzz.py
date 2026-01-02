@@ -3,6 +3,7 @@ from cxfuncs import CXFUZZ
 import argparse
 import numpy as np
 import os
+import pickle
 import random
 import shutil
 import sys
@@ -184,12 +185,14 @@ def main():
                 if cxfuzz.cur_api_is_class:
                     cxfuzz.cur_output_args_of_mutate2 = cxfuzz.cur_input_args_for_mutate2.copy()
                     cxfuzz.cur_output_kwargs_of_mutate2 = cxfuzz.cur_input_kwargs_for_mutate2.copy()
+                cxfuzz.cur_key_ele_pos = cxfuzz.cur_key_ele_pos1
                 cxfuzz.mutate()
                 if cxfuzz.cur_api_is_class:
                     cxfuzz.cur_output_args_of_mutate3 = cxfuzz.cur_output_args_of_mutate.copy()
                     cxfuzz.cur_output_kwargs_of_mutate3 = cxfuzz.cur_output_kwargs_of_mutate.copy()
                     cxfuzz.cur_output_args_of_mutate = cxfuzz.cur_output_args_of_mutate2.copy()
                     cxfuzz.cur_output_kwargs_of_mutate = cxfuzz.cur_output_kwargs_of_mutate2.copy()
+                    cxfuzz.cur_key_ele_pos = cxfuzz.cur_key_ele_pos2
                     cxfuzz.mutate()
                     cxfuzz.cur_output_args_of_mutate2 = cxfuzz.cur_output_args_of_mutate.copy()
                     cxfuzz.cur_output_kwargs_of_mutate2 = cxfuzz.cur_output_kwargs_of_mutate.copy()
@@ -234,6 +237,117 @@ def main():
                         cxfuzz.update_favored_queue()
                         cxfuzz.cur_map_density = cxfuzz.virgin_byte_density()
                         cxfuzz.update_plot_data_file()
+
+                        analysis_pos_label = False
+                        if analysis_pos_label == True:
+                            # bak new_behavior seed and testcase
+                            bak_trace_bits = cxfuzz.trace_bits[:cxfuzz.map_size].copy()
+                            bak_input_args_for_mutate = cxfuzz.cur_input_args_for_mutate.copy()
+                            bak_input_kwargs_for_mutate = cxfuzz.cur_input_kwargs_for_mutate.copy()
+                            bak_output_args_of_mutate = cxfuzz.cur_output_args_of_mutate.copy()
+                            bak_output_kwargs_of_mutate = cxfuzz.cur_output_kwargs_of_mutate.copy()
+                            if cxfuzz.cur_api_is_class:
+                                bak_input_args_for_mutate2 = cxfuzz.cur_input_args_for_mutate2.copy()
+                                bak_input_kwargs_for_mutate2 = cxfuzz.cur_input_kwargs_for_mutate2.copy()
+                                bak_output_args_of_mutate2 = cxfuzz.cur_output_args_of_mutate.copy()
+                                bak_output_kwargs_of_mutate2 = cxfuzz.cur_output_kwargs_of_mutate.copy()
+                            key_ele_pos1 = []
+                            key_ele_pos2 = []
+                            minlen = min(len(bak_input_args_for_mutate),len(bak_output_args_of_mutate))
+                            for i in range(minlen):
+                                if not cxfuzz.is_equal(bak_input_args_for_mutate[i],bak_output_args_of_mutate[i]):
+                                    cxfuzz.cur_output_args_of_mutate = bak_input_args_for_mutate.copy()
+                                    cxfuzz.cur_output_kwargs_of_mutate = bak_input_kwargs_for_mutate.copy()
+                                    if cxfuzz.cur_api_is_class:
+                                        cxfuzz.cur_output_args_of_mutate2 = bak_input_args_for_mutate2.copy()
+                                        cxfuzz.cur_output_kwargs_of_mutate2 = bak_input_kwargs_for_mutate2.copy()
+                                    cxfuzz.cur_output_args_of_mutate[i] = bak_output_args_of_mutate[i]
+                                    status = cxfuzz.runapi()
+                                    cxfuzz.classify_counts()
+                                    if status < 0:
+                                        cxfuzz.total_crashes +=1
+                                        hnc = cxfuzz.has_new_crash()
+                                        if hnc > 0:
+                                            cxfuzz.save_to_crash()
+                                            cxfuzz.update_crash_bits()
+                                            cxfuzz.hnc_nums += 1
+                                    else:
+                                        if status == 2:
+                                            cxfuzz.timeout_nums +=1
+                                            break
+                                        elif status == 3:
+                                            cxfuzz.memout_nums +=1
+                                            break
+                                        elif status in (0,1):
+                                            if status == 0:
+                                                cxfuzz.passed_runs += 1
+                                            hnb = cxfuzz.has_new_bits()
+                                            if hnb > 0:
+                                                cxfuzz.save_to_queue(status)
+                                                cxfuzz.update_virgin_bits()
+                                                cxfuzz.update_queue_minibits_dict()
+                                                cxfuzz.update_favored_queue()
+                                                cxfuzz.cur_map_density = cxfuzz.virgin_byte_density()
+                                                cxfuzz.update_plot_data_file()
+                                            is_fully_equal = np.array_equal(bak_trace_bits, cxfuzz.trace_bits[:cxfuzz.map_size])
+                                            if is_fully_equal:
+                                                key_ele_pos1.append(i)
+                            if cxfuzz.cur_api_is_class:
+                                minlen = min(len(bak_input_args_for_mutate2),len(bak_output_args_of_mutate2))
+                                for i in range(minlen):
+                                    if not cxfuzz.is_equal(bak_input_args_for_mutate2[i],bak_output_args_of_mutate2[i]):
+                                        cxfuzz.cur_output_args_of_mutate = bak_input_args_for_mutate.copy()
+                                        cxfuzz.cur_output_kwargs_of_mutate = bak_input_kwargs_for_mutate.copy()
+                                        if cxfuzz.cur_api_is_class:
+                                            cxfuzz.cur_output_args_of_mutate2 = bak_input_args_for_mutate2.copy()
+                                            cxfuzz.cur_output_kwargs_of_mutate2 = bak_input_kwargs_for_mutate2.copy()
+                                        cxfuzz.cur_output_args_of_mutate2[i] = bak_output_args_of_mutate2[i]
+                                        status = cxfuzz.runapi()
+                                        cxfuzz.classify_counts()
+                                        if status < 0:
+                                            cxfuzz.total_crashes +=1
+                                            hnc = cxfuzz.has_new_crash()
+                                            if hnc > 0:
+                                                cxfuzz.save_to_crash()
+                                                cxfuzz.update_crash_bits()
+                                                cxfuzz.hnc_nums += 1
+                                        else:
+                                            if status == 2:
+                                                cxfuzz.timeout_nums +=1
+                                                break
+                                            elif status == 3:
+                                                cxfuzz.memout_nums +=1
+                                                break
+                                            elif status in (0,1):
+                                                if status == 0:
+                                                    cxfuzz.passed_runs += 1
+                                                hnb = cxfuzz.has_new_bits()
+                                                if hnb > 0:
+                                                    cxfuzz.save_to_queue(status)
+                                                    cxfuzz.update_virgin_bits()
+                                                    cxfuzz.update_queue_minibits_dict()
+                                                    cxfuzz.update_favored_queue()
+                                                    cxfuzz.cur_map_density = cxfuzz.virgin_byte_density()
+                                                    cxfuzz.update_plot_data_file()
+                                                is_fully_equal = np.array_equal(bak_trace_bits, cxfuzz.trace_bits[:cxfuzz.map_size])
+                                                if is_fully_equal:
+                                                    key_ele_pos2.append(i)
+                            if len(key_ele_pos1) > 0 or len(key_ele_pos1) > 0 :
+                                merge_ele_pos1 = list(dict.fromkeys(key_ele_pos1 + cxfuzz.cur_key_ele_pos1))
+                                merge_ele_pos2 = list(dict.fromkeys(key_ele_pos2 + cxfuzz.cur_key_ele_pos2))
+                                cxfuzz.cur_key_ele_pos1 = merge_ele_pos1
+                                cxfuzz.cur_key_ele_pos2 = merge_ele_pos2
+                                key_ele_pos = [merge_ele_pos1,merge_ele_pos2]
+                                try:
+                                    queue_key_ele_pos_file = os.path.join(cxfuzz.output_dir,cxfuzz.cur_api_name,'queue_key_ele_pos.pkl')
+                                    with open(queue_key_ele_pos_file, 'rb') as f:
+                                        queue_key_ele_pos = pickle.load(f)
+                                    queue_key_ele_pos[cxfuzz.cur_seed_name] = key_ele_pos
+                                    with open(queue_key_ele_pos_file, 'wb') as f:
+                                        pickle.dump(queue_key_ele_pos, f)
+                                except:
+                                    cxfuzz.fatal()
+
                     if cxfuzz.enable_asan_func_hash_check == True:
                         start_time = time.perf_counter()
                         trace_bits2_uint32 = cxfuzz.trace_bits2.view(np.uint32)
