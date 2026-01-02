@@ -106,6 +106,9 @@ class CXFUZZ:
     plot_data_file = None
     current_time_s = 0
     last_check_llm_iterations = 0
+    cur_key_ele_pos = []
+    cur_key_ele_pos1 = []
+    cur_key_ele_pos2 = []
 
     def __init__(self):
         pass
@@ -310,6 +313,14 @@ class CXFUZZ:
                 queue_hashes = set()
                 with open(queue_hashes_file,'wb') as f:
                     pickle.dump(queue_hashes,f)
+            except:
+                self.fatal_error()
+            queue_key_ele_pos_file = os.path.join(api_dir,'queue_key_ele_pos.pkl')
+            if os.path.exists(queue_key_ele_pos_file):
+                self.fatal_error()
+            try:
+                with open(queue_key_ele_pos_file,'wb') as f:
+                    pickle.dump({},f)
             except:
                 self.fatal_error()
             queue_fuzzed_file = os.path.join(api_dir,'queue_fuzzed.pkl')
@@ -589,6 +600,18 @@ class CXFUZZ:
         else:
             self.cur_output_args_of_mutate2 = []
             self.cur_output_kwargs_of_mutate2 = {}
+        queue_key_ele_pos_file = os.path.join(self.output_dir,self.cur_api_name,'queue_key_ele_pos.pkl')
+        self.cur_key_ele_pos = []
+        self.cur_key_ele_pos1 = []
+        self.cur_key_ele_pos2 = []
+        try:
+            with open(queue_key_ele_pos_file,'rb') as f:
+                queue_key_ele_pos = pickle.load(f)
+                if self.cur_seed_name in queue_key_ele_pos:
+                    self.cur_key_ele_pos1 = queue_key_ele_pos[self.cur_seed_name][0]
+                    self.cur_key_ele_pos2 = queue_key_ele_pos[self.cur_seed_name][1]
+        except:
+            self.fatal_error()
     
     def store_queue_fuzzed(self):
         api_dir = os.path.join(self.output_dir,self.cur_api_name)
@@ -1442,9 +1465,18 @@ class CXFUZZ:
                 self.cur_output_args_of_mutate = self.mutate_add_item(self.cur_output_args_of_mutate, target_id, new_item)
             elif operation == "replace":
                 new_item = self._generate_random_args_item()
-                count = self.count_all_items(self.cur_output_args_of_mutate)
-                target_id = random.randint(1, count)
-                self.cur_output_args_of_mutate = self.mutate_replace_item(self.cur_output_args_of_mutate, target_id, new_item)
+                if (len(self.cur_key_ele_pos) > 0) and (random.random() < 0.3):
+                    pos = random.choice(self.cur_key_ele_pos)
+                    if pos < len(self.cur_output_args_of_mutate):
+                        self.cur_output_args_of_mutate[pos] = new_item
+                    else:
+                        count = self.count_all_items(self.cur_output_args_of_mutate)
+                        target_id = random.randint(1, count)
+                        self.cur_output_args_of_mutate = self.mutate_replace_item(self.cur_output_args_of_mutate, target_id, new_item)
+                else:
+                    count = self.count_all_items(self.cur_output_args_of_mutate)
+                    target_id = random.randint(1, count)
+                    self.cur_output_args_of_mutate = self.mutate_replace_item(self.cur_output_args_of_mutate, target_id, new_item)
             elif operation == "copy":
                 count = self.count_all_items(self.cur_output_args_of_mutate)
                 target_id = random.randint(1, count)
@@ -2091,10 +2123,22 @@ class CXFUZZ:
         else: 
             num_mutations = random.randint(1, count)
         for _ in range(num_mutations):
-            target_id = random.randint(1, count)
-            target_item = self.choose_one_from_items(self.cur_output_args_of_mutate, target_id)
-            binary_mutate_item = self.binary_mutate_item(target_item)
-            self.cur_output_args_of_mutate = self.mutate_replace_item_without_containers(self.cur_output_args_of_mutate, target_id, binary_mutate_item)
+            label = 0
+            if (len(self.cur_key_ele_pos) > 0) and (random.random() < 0.3):
+                pos = random.choice(self.cur_key_ele_pos)
+                if pos < len(self.cur_output_args_of_mutate):
+                    if not isinstance(self.cur_output_args_of_mutate[pos],list):
+                        if not isinstance(self.cur_output_args_of_mutate[pos],tuple):
+                            label = 1
+            if label == 1:
+                target_item = self.cur_output_args_of_mutate[pos]
+                binary_mutate_item = self.binary_mutate_item(target_item)
+                self.cur_output_args_of_mutate[pos] = binary_mutate_item
+            else:
+                target_id = random.randint(1, count)
+                target_item = self.choose_one_from_items(self.cur_output_args_of_mutate, target_id)
+                binary_mutate_item = self.binary_mutate_item(target_item)
+                self.cur_output_args_of_mutate = self.mutate_replace_item_without_containers(self.cur_output_args_of_mutate, target_id, binary_mutate_item)
 
     def random_mutate_kwargs(self):
         if not self.cur_output_kwargs_of_mutate:
@@ -2669,6 +2713,28 @@ class CXFUZZ:
             coverage = int(self.cur_map_density * self.map_size)
             content = str(cur_time_s)+","+str(coverage)
             f.write(content + '\n')
+
+    def is_equal(self, item1, item2):
+        if type(item1) != type(item2):
+            return False
+        if isinstance(item1, torch.Tensor) and isinstance(item2, torch.Tensor):
+            try:
+                return torch.equal(item1, item2)
+            except:
+                return False
+        elif isinstance(item1, (list, tuple)):
+            if len(item1) != len(item2):
+                return False
+            return all(self.is_equal(a, b) for a, b in zip(item1, item2))
+        elif isinstance(item1, dict):
+            if item1.keys() != item2.keys():
+                return False
+            return all(self.is_equal(item1[k], item2[k]) for k in item1)
+        else:
+            try:
+                return item1 == item2
+            except:
+                return False
             
     def exit_fuzz(self):
         # clean some thing before exit
